@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 'use strict';
-// claude-usage-hook: reports Claude Code token usage per session/PC to a claude-usage-dashboard server.
+// claude-usage-reporter: reports Claude Code token usage per session/PC to a claude-usage-dashboard server.
 //
 //   node hook.js                       hook mode: reads the hook event JSON from stdin, reports in the background
-//   node hook.js install --url U --token T [--name "PC label"] [--no-statusline]
-//   node hook.js uninstall
+//   node hook.js setup URL TOKEN [PC name]   plugin mode: save config + status line (hooks come from the plugin)
+//   node hook.js install --url U --token T [--name "PC label"] [--no-statusline]   standalone: also adds hooks to settings
+//   node hook.js uninstall             remove config-side hooks and restore the previous status line
 //   node hook.js status
-//   node hook.js sync                   scan every transcript under ~/.claude/projects and upload what is new (backfill)
-//   node hook.js test                   ping the server with the configured token
+//   node hook.js sync                  scan every transcript under ~/.claude/projects and upload what is new (backfill)
+//   node hook.js test                  ping the server with the configured token
 //
 // No dependencies. Node 18+.
 
@@ -29,7 +30,10 @@ const QUEUE_DIR = path.join(HOOK_DIR, 'queue');
 const SETTINGS_FILE = path.join(CLAUDE_DIR, 'settings.json');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const SELF = path.resolve(__filename).replace(/\\/g, '/');
-const STATUSLINE = path.join(path.dirname(path.resolve(__filename)), 'statusline.js').replace(/\\/g, '/');
+const STATUSLINE_SRC = path.join(path.dirname(path.resolve(__filename)), 'statusline.js');
+// The status line command is stored in settings.json, so it points at a copy that survives plugin updates
+// (the plugin directory can move between versions). The copy is refreshed whenever the source is newer.
+const STATUSLINE = path.join(HOOK_DIR, 'statusline.js').replace(/\\/g, '/');
 const MARKER = 'claude-usage-hook';
 const EVENTS = ['SessionStart', 'Stop', 'SubagentStop', 'SessionEnd'];
 const BATCH = 1500; // messages per POST
@@ -47,8 +51,15 @@ function log(msg) {
 }
 function loadConfig() {
   const c = readJson(CONFIG_FILE, null);
-  if (!c || !c.url || !c.token) throw new Error(`not configured: run  node "${SELF}" install --url ... --token ...`);
+  if (!c || !c.url || !c.token) throw new Error(`not configured: run  /claude-usage-reporter:setup <url> <token>  or  node "${SELF}" install --url ... --token ...`);
   return c;
+}
+function syncStatusline() {
+  try {
+    const src = fs.statSync(STATUSLINE_SRC);
+    let dst = null; try { dst = fs.statSync(STATUSLINE); } catch {}
+    if (!dst || src.mtimeMs > dst.mtimeMs) { fs.mkdirSync(HOOK_DIR, { recursive: true }); fs.copyFileSync(STATUSLINE_SRC, STATUSLINE); }
+  } catch (e) { log(`statusline copy failed: ${e.message}`); }
 }
 
 // ---------- PC identity ----------
@@ -263,6 +274,7 @@ async function workerMode(file) {
   const event = readJson(file, {});
   try {
     const cfg = loadConfig();
+    if (!cfg.noStatusline) syncStatusline();
     await report(event, cfg);
   } catch (e) {
     log(`${event.hook_event_name || '?'} ${event.session_id || ''}: FAILED ${e.message}`);
@@ -301,7 +313,7 @@ function parseArgs(argv) {
   return a;
 }
 
-const isOurs = (h) => !!(h && typeof h.command === 'string' && (h.command.includes(SELF) || h.command.includes(STATUSLINE) || h.command.includes(MARKER)));
+const isOurs = (h) => !!(h && typeof h.command === 'string' && (h.command.includes(SELF) || h.command.includes(STATUSLINE) || h.command.includes(STATUSLINE_SRC.replace(/\\/g, '/')) || h.command.includes(MARKER)));
 
 function install(args) {
   const prev = readJson(CONFIG_FILE, {});
@@ -320,13 +332,7 @@ function install(args) {
     list.push({ matcher: '', hooks: [{ type: 'command', command: `node "${SELF}" ${ev}`, timeout: 20, async: true }] });
     settings.hooks[ev] = list;
   }
-  if (!args['no-statusline']) {
-    const sl = settings.statusLine;
-    if (sl && !isOurs(sl)) cfg.statusLinePassthrough = sl; // keep the user's own status line running
-    settings.statusLine = { type: 'command', command: `node "${STATUSLINE}"`, padding: 0 };
-  } else if (settings.statusLine && isOurs(settings.statusLine)) {
-    if (cfg.statusLinePassthrough) settings.statusLine = cfg.statusLinePassthrough; else delete settings.statusLine;
-  }
+  applyStatusline(settings, cfg, !!args['no-statusline']);
   writeJson(CONFIG_FILE, cfg);
   writeJson(SETTINGS_FILE, settings);
   const pc = pcInfo(cfg);
@@ -335,6 +341,54 @@ function install(args) {
   console.log(`server:   ${cfg.url}`);
   console.log(`PC:       ${pc.name} (${pc.id.slice(0, 12)}...)`);
   console.log('Restart Claude Code sessions for the hooks to take effect. Run "node hook.js sync" to upload past sessions.');
+  return test();
+}
+
+// Status line: install our wrapper (keeping any existing status line as passthrough) or restore the previous one.
+function applyStatusline(settings, cfg, disable) {
+  if (!disable) {
+    syncStatusline();
+    const sl = settings.statusLine;
+    if (sl && !isOurs(sl)) cfg.statusLinePassthrough = sl; // keep the user's own status line running
+    settings.statusLine = { type: 'command', command: `node "${STATUSLINE}"`, padding: 0 };
+    delete cfg.noStatusline;
+  } else {
+    cfg.noStatusline = true;
+    if (settings.statusLine && isOurs(settings.statusLine)) {
+      if (cfg.statusLinePassthrough) settings.statusLine = cfg.statusLinePassthrough; else delete settings.statusLine;
+    }
+  }
+}
+
+// Plugin mode: /claude-usage-reporter:setup <url> <token> [PC name]. Hooks come from the plugin's hooks.json,
+// so only the config file and the status line are written; hooks left behind by a standalone `install` are removed.
+function setup(argv) {
+  const [url, token, ...rest] = argv.filter((a) => a !== '--no-statusline');
+  const noStatusline = argv.includes('--no-statusline');
+  if (!url || !token || !/^https?:\/\//.test(url)) {
+    console.error('usage: /claude-usage-reporter:setup <http(s)://server:3003> <token> [PC name] [--no-statusline]');
+    process.exit(2);
+  }
+  const cfg = { ...readJson(CONFIG_FILE, {}), url, token };
+  if (rest.length) cfg.name = rest.join(' ');
+  const settings = readJson(SETTINGS_FILE, {});
+  let removed = 0;
+  for (const ev of Object.keys(settings.hooks || {})) {
+    settings.hooks[ev] = settings.hooks[ev].map((m) => ({ ...m, hooks: (m.hooks || []).filter((h) => { if (isOurs(h)) { removed++; return false; } return true; }) })).filter((m) => m.hooks.length);
+    if (!settings.hooks[ev].length) delete settings.hooks[ev];
+  }
+  if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
+  applyStatusline(settings, cfg, noStatusline);
+  writeJson(CONFIG_FILE, cfg);
+  writeJson(SETTINGS_FILE, settings);
+  const pc = pcInfo(cfg);
+  console.log(`Configured claude-usage-reporter.`);
+  console.log(`  server:  ${cfg.url}`);
+  console.log(`  PC:      ${pc.name} (${pc.id.slice(0, 12)}...)`);
+  console.log(`  config:  ${CONFIG_FILE}`);
+  console.log(`  status line: ${noStatusline ? 'left unchanged (no plan-window percentages will be reported)' : 'installed in ' + SETTINGS_FILE + (cfg.statusLinePassthrough ? ' (previous status line kept as passthrough)' : '')}`);
+  if (removed) console.log(`  removed ${removed} hook entr${removed === 1 ? 'y' : 'ies'} from a previous standalone install (the plugin provides them now)`);
+  console.log('Reporting starts with the next Claude Code session. Run /claude-usage-reporter:sync to upload past sessions.');
   return test();
 }
 
@@ -386,7 +440,7 @@ function status() {
 }
 
 function help() {
-  const lines = fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 12);
+  const lines = fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 13);
   console.log(lines.map((l) => l.replace(/^\/\/ ?/, '')).join('\n'));
 }
 
@@ -395,6 +449,7 @@ function help() {
   try {
     if (cmd === '--worker') return await workerMode(rest[0]);
     if (cmd === 'install') return await install(parseArgs(rest));
+    if (cmd === 'setup') return await setup(rest);
     if (cmd === 'uninstall') return uninstall();
     if (cmd === 'status') return status();
     if (cmd === 'sync') return await syncMode();
