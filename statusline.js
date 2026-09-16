@@ -26,6 +26,12 @@ process.stdin.on('end', () => {
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch {}
 
+  // Diagnostics: proves the status line is being invoked at all (see `hook.js status`).
+  try {
+    fs.mkdirSync(HOOK_DIR, { recursive: true });
+    fs.writeFileSync(path.join(HOOK_DIR, 'statusline-last.json'), JSON.stringify({ invokedAt: new Date().toISOString(), hasRateLimits: !!d.rate_limits, keys: Object.keys(d), version: d.version || null }));
+  } catch {}
+
   if (d.rate_limits) {
     try {
       fs.mkdirSync(HOOK_DIR, { recursive: true });

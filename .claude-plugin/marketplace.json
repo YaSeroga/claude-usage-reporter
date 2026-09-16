@@ -6,7 +6,7 @@
       "name": "claude-usage-reporter",
       "source": "./",
       "description": "Report Claude Code token usage and plan windows per PC to your own claude-usage-dashboard server.",
-      "version": "0.2.1"
+      "version": "0.2.2"
     }
   ]
 }

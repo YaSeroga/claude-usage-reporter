@@ -1,6 +1,6 @@
 {
   "name": "claude-usage-reporter",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Reports Claude Code token usage (per session, model, subagent) and plan rate-limit windows to your own claude-usage-dashboard server, so one page shows which PC burns what.",
   "author": { "name": "YaSeroga" },
   "repository": "https://github.com/YaSeroga/claude-usage-reporter",

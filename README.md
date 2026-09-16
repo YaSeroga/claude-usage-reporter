@@ -75,6 +75,11 @@ title (custom title or the first 160 characters of the first prompt), the workin
 
 ## Caveats
 
+- **Plan-window percentages need a terminal session.** Claude Code only hands `rate_limits` to a
+  status line, and the desktop app / VS Code extension do not render status lines, so PCs that use
+  only the desktop app report token usage but no percentages (`/claude-usage-reporter:status` shows
+  whether the status line was ever invoked). The dashboard's "Calibrate" box accepts the percentages
+  shown by the app's usage ring instead; one reading per day is enough to split the windows across PCs.
 - The transcript format is internal to Claude Code and may change between versions; the parser is
   defensive (unknown lines are skipped) but a format change can silently stop the numbers. Compare
   with `/usage` or `/cost` now and then.

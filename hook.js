@@ -446,6 +446,8 @@ function status() {
     const fh = r.rateLimits.five_hour || {}, sd = r.rateLimits.seven_day || {};
     console.log(`rate limits (${r.capturedAt}): 5h ${fh.used_percentage ?? '?'}%  7d ${sd.used_percentage ?? '?'}%`);
   }
+  const sl = readJson(path.join(HOOK_DIR, 'statusline-last.json'), null);
+  console.log(`status line: ${sl ? `last invoked ${sl.invokedAt}${sl.hasRateLimits ? ' with' : ' WITHOUT'} rate_limits (Claude Code ${sl.version || '?'})` : 'never invoked on this PC (plan-window percentages need a surface that renders the status line)'}`);
   console.log(`log:        ${LOG_FILE}`);
 }
 
