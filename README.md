@@ -1,0 +1,74 @@
+# claude-usage-hook
+
+A Claude Code hook that reports token usage to a [claude-usage-dashboard](../dashboard) server, so one
+page shows which PC is burning which part of the Claude plan, on which model, in which project, with
+subagents (Explore, general-purpose, …) broken out.
+
+Two small Node scripts, no dependencies:
+
+- `hook.js` runs on `SessionStart`, `Stop`, `SubagentStop` and `SessionEnd`. It reads the session
+  transcript (`~/.claude/projects/<project>/<session>.jsonl` plus `<session>/subagents/*.jsonl`),
+  extracts every API call's `usage` block (input, output, cache read/write, thinking tokens, model,
+  effort, agent), and POSTs the ones it has not sent yet. Offsets are kept per file in
+  `~/.claude/usage-hook/state.json`, so each report only carries what is new. The hook itself returns
+  immediately and hands the work to a detached child process, so Claude Code never waits on the network.
+- `statusline.js` is a Claude Code status line. Claude Code feeds it `rate_limits` (the 5-hour and
+  7-day plan windows shown by `/usage`, Pro/Max only); it stores the latest snapshot and prints
+  `Model | ctx 12% | 5h 23% (2h 10m) | 7d 41% (3d 4h)`. The hook attaches that snapshot to its next
+  report, so the dashboard also shows the official plan percentages per PC. A status line that was
+  already configured keeps running (it is called as a passthrough).
+
+## Install on a PC
+
+Requires Node 18+ and Claude Code.
+
+```bash
+git clone <this repo> claude-usage-hook
+cd claude-usage-hook
+node hook.js install --url https://nana-server.tail343ff8.ts.net:3003 --token <INGEST_TOKEN> --name "Nana PC"
+node hook.js sync        # optional: upload every past session found under ~/.claude/projects
+```
+
+`install` writes `~/.claude/usage-hook/config.json` and adds the hooks (and the status line) to
+`~/.claude/settings.json`; re-running it is safe. Start a new Claude Code session for the hooks to
+take effect. Options: `--no-statusline` to leave the status line alone (then no plan-window
+percentages are reported), `--insecure` to skip TLS verification for self-signed servers.
+
+Other commands:
+
+```bash
+node hook.js status      # what is configured, last report time, last rate-limit snapshot
+node hook.js test        # ping the server with the configured token
+node hook.js sync        # upload anything not yet sent (also usable from a scheduled task instead of hooks)
+node hook.js uninstall   # remove the hooks and restore the previous status line
+```
+
+Log: `~/.claude/usage-hook/hook.log`. `CLAUDE_CONFIG_DIR` is honoured.
+
+## What gets sent
+
+One `POST /api/ingest` per report, `Authorization: Bearer <token>`:
+
+```json
+{
+  "v": 1, "event": "Stop", "sentAt": "2026-09-16T12:00:00Z",
+  "pc": { "id": "<machineID from ~/.claude.json>", "name": "Nana PC", "hostname": "DESKTOP-1", "user": "nana", "platform": "win32 10.0.26200", "account": { "email": "...", "org": "..." } },
+  "session": { "id": "<session uuid>", "cwd": "D:\\Server", "gitBranch": "main", "version": "2.1.271", "entrypoint": "claude-desktop", "title": "Windows server dashboard", "startedAt": "..." },
+  "messages": [ { "id": "msg_01…", "ts": "…", "model": "claude-fable-5-1", "agentId": null, "agentType": "main", "agentDesc": null,
+                  "input": 32, "output": 190, "cacheRead": 527706, "cacheCreate": 2893, "cache1h": 2893, "cache5m": 0, "thinking": 0, "effort": "high", "requestId": "req_…", "stopReason": "end_turn" } ],
+  "rateLimits": { "capturedAt": "…", "model": "claude-fable-5-1", "rateLimits": { "five_hour": { "used_percentage": 23.5, "resets_at": 1789570000 }, "seven_day": { "used_percentage": 41.2, "resets_at": 1789900000 } } }
+}
+```
+
+No prompt or response text leaves the machine: only usage numbers, model/agent names, the session
+title (custom title or the first 160 characters of the first prompt), the working directory and branch.
+
+## Caveats
+
+- The transcript format is internal to Claude Code and may change between versions; the parser is
+  defensive (unknown lines are skipped) but a format change can silently stop the numbers. Compare
+  with `/usage` or `/cost` now and then.
+- `rate_limits` only appears for Pro/Max subscriptions, and only after the first response of a
+  session, so a fresh PC shows plan windows after its first turn.
+- Streaming writes several transcript entries per API message; they share `message.id` and usage, so
+  messages are deduplicated by that id (also server-side).
