@@ -1,6 +1,6 @@
-# claude-usage-hook
+# claude-usage-reporter
 
-A Claude Code hook that reports token usage to a [claude-usage-dashboard](../dashboard) server, so one
+A Claude Code hook that reports token usage to a claude-usage-dashboard server, so one
 page shows which PC is burning which part of the Claude plan, on which model, in which project, with
 subagents (Explore, general-purpose, …) broken out.
 
@@ -23,14 +23,15 @@ Two small Node scripts, no dependencies:
 Requires Node 18+ and Claude Code.
 
 ```bash
-git clone <this repo> claude-usage-hook
-cd claude-usage-hook
-node hook.js install --url https://nana-server.tail343ff8.ts.net:3003 --token <INGEST_TOKEN> --name "Nana PC"
+git clone git@github.com:YaSeroga/claude-usage-reporter.git
+cd claude-usage-reporter
+node hook.js install --url https://your-server:3003 --token <INGEST_TOKEN> --name "My PC"
 node hook.js sync        # optional: upload every past session found under ~/.claude/projects
 ```
 
 `install` writes `~/.claude/usage-hook/config.json` and adds the hooks (and the status line) to
-`~/.claude/settings.json`; re-running it is safe. Start a new Claude Code session for the hooks to
+`~/.claude/settings.json`; re-running it is safe. The server URL, token and PC name live only in that
+local config file: nothing in this repository is specific to a server or a machine. Start a new Claude Code session for the hooks to
 take effect. Options: `--no-statusline` to leave the status line alone (then no plan-window
 percentages are reported), `--insecure` to skip TLS verification for self-signed servers.
 
@@ -52,7 +53,7 @@ One `POST /api/ingest` per report, `Authorization: Bearer <token>`:
 ```json
 {
   "v": 1, "event": "Stop", "sentAt": "2026-09-16T12:00:00Z",
-  "pc": { "id": "<machineID from ~/.claude.json>", "name": "Nana PC", "hostname": "DESKTOP-1", "user": "nana", "platform": "win32 10.0.26200", "account": { "email": "...", "org": "..." } },
+  "pc": { "id": "<machineID from ~/.claude.json>", "name": "My PC", "hostname": "DESKTOP-1", "user": "alice", "platform": "win32 10.0.26200", "account": { "email": "...", "org": "..." } },
   "session": { "id": "<session uuid>", "cwd": "D:\\Server", "gitBranch": "main", "version": "2.1.271", "entrypoint": "claude-desktop", "title": "Windows server dashboard", "startedAt": "..." },
   "messages": [ { "id": "msg_01…", "ts": "…", "model": "claude-fable-5-1", "agentId": null, "agentType": "main", "agentDesc": null,
                   "input": 32, "output": 190, "cacheRead": 527706, "cacheCreate": 2893, "cache1h": 2893, "cache5m": 0, "thinking": 0, "effort": "high", "requestId": "req_…", "stopReason": "end_turn" } ],
