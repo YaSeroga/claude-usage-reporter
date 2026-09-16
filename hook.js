@@ -220,7 +220,7 @@ async function report(event, cfg) {
   const msgs = [...collected.messages.values()];
   const lifecycle = event.hook_event_name === 'SessionStart' || event.hook_event_name === 'SessionEnd';
   if (!msgs.length && !rate && !lifecycle) {
-    log(`${event.hook_event_name} ${sessionId}: nothing new`);
+    if (event.hook_event_name !== 'sync') log(`${event.hook_event_name} ${sessionId}: nothing new`);
     return { sent: 0 };
   }
   let sent = 0;
@@ -276,6 +276,7 @@ async function workerMode(file) {
     const cfg = loadConfig();
     if (!cfg.noStatusline) syncStatusline();
     await report(event, cfg);
+    if (event.hook_event_name === 'SessionStart') await syncAll(cfg, true); // catch up on anything missed while the server was down
   } catch (e) {
     log(`${event.hook_event_name || '?'} ${event.session_id || ''}: FAILED ${e.message}`);
   } finally {
@@ -283,8 +284,10 @@ async function workerMode(file) {
   }
 }
 
-async function syncMode() {
-  const cfg = loadConfig();
+// Upload everything under ~/.claude/projects that has not been sent yet. Runs on demand (sync / setup) and
+// automatically at every SessionStart, so sessions that ended while the server was unreachable catch up.
+async function syncAll(cfg, quiet) {
+  const say = quiet ? () => {} : (m) => console.log(m);
   let sessions = 0, total = 0, failed = 0;
   for (const proj of safeReaddir(PROJECTS_DIR)) {
     const dir = path.join(PROJECTS_DIR, proj);
@@ -294,11 +297,17 @@ async function syncMode() {
       try {
         const r = await report({ hook_event_name: 'sync', session_id: sessionId, transcript_path: path.join(dir, f) }, cfg);
         sessions++; total += r.sent;
-        if (r.sent) console.log(`${sessionId}: ${r.sent} new message(s)`);
-      } catch (e) { failed++; console.error(`${sessionId}: ${e.message}`); }
+        if (r.sent) say(`${sessionId}: ${r.sent} new message(s)`);
+      } catch (e) { failed++; if (!quiet) console.error(`${sessionId}: ${e.message}`); }
     }
   }
-  console.log(`sync done: ${sessions} session(s) scanned, ${total} message(s) uploaded${failed ? `, ${failed} failed` : ''}`);
+  const summary = `sync: ${sessions} session(s) scanned, ${total} message(s) uploaded${failed ? `, ${failed} failed` : ''}`;
+  say(summary); log(summary);
+  return { sessions, total, failed };
+}
+
+async function syncMode() {
+  const { failed } = await syncAll(loadConfig(), false);
   if (failed) process.exitCode = 1;
 }
 
@@ -362,7 +371,7 @@ function applyStatusline(settings, cfg, disable) {
 
 // Plugin mode: /claude-usage-reporter:setup <url> <token> [PC name]. Hooks come from the plugin's hooks.json,
 // so only the config file and the status line are written; hooks left behind by a standalone `install` are removed.
-function setup(argv) {
+async function setup(argv) {
   const [url, token, ...rest] = argv.filter((a) => a !== '--no-statusline');
   const noStatusline = argv.includes('--no-statusline');
   if (!url || !token || !/^https?:\/\//.test(url)) {
@@ -388,8 +397,9 @@ function setup(argv) {
   console.log(`  config:  ${CONFIG_FILE}`);
   console.log(`  status line: ${noStatusline ? 'left unchanged (no plan-window percentages will be reported)' : 'installed in ' + SETTINGS_FILE + (cfg.statusLinePassthrough ? ' (previous status line kept as passthrough)' : '')}`);
   if (removed) console.log(`  removed ${removed} hook entr${removed === 1 ? 'y' : 'ies'} from a previous standalone install (the plugin provides them now)`);
-  console.log('Reporting starts with the next Claude Code session. Run /claude-usage-reporter:sync to upload past sessions.');
-  return test();
+  console.log('Reporting starts with the next Claude Code session; past sessions are uploaded now and at every session start.');
+  await test();
+  if (!process.exitCode) await syncAll(cfg, false);
 }
 
 function uninstall() {

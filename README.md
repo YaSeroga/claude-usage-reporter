@@ -28,13 +28,15 @@ In Claude Code, on each PC:
 /plugin marketplace add YaSeroga/claude-usage-reporter
 /plugin install claude-usage-reporter@yaseroga
 /claude-usage-reporter:setup http://your-server:3003 <INGEST_TOKEN> "My PC"
-/claude-usage-reporter:sync
 ```
 
 - `setup` saves the config, installs the status line into `~/.claude/settings.json` (plugins cannot
-  set a status line themselves) and pings the server. Add `--no-statusline` to leave the status line
-  alone; then no plan-window percentages are reported. The hooks themselves come with the plugin.
-- `sync` uploads every past session found under `~/.claude/projects`; it is optional.
+  set a status line themselves), pings the server and uploads every past session found under
+  `~/.claude/projects`. Add `--no-statusline` to leave the status line alone; then no plan-window
+  percentages are reported. The hooks themselves come with the plugin.
+- Reporting is automatic from then on: every turn end and session end sends what is new, and every
+  session start re-scans all transcripts, so sessions that ended while the server was unreachable
+  catch up by themselves. `/claude-usage-reporter:sync` forces that scan right now.
 - `/claude-usage-reporter:status` shows what is configured and the last report.
 - `/plugin update` picks up new versions. Requires Node 18+ on the PC.
 
