@@ -1,6 +1,6 @@
 {
   "name": "claude-usage-reporter",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Claude Code plugin/hook that reports per-session token usage and plan rate-limit windows to a claude-usage-dashboard server",
   "repository": "github:YaSeroga/claude-usage-reporter",
   "bin": { "claude-usage-reporter": "hook.js" },

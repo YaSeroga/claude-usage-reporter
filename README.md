@@ -38,6 +38,8 @@ In Claude Code, on each PC:
   session start re-scans all transcripts, so sessions that ended while the server was unreachable
   catch up by themselves. `/claude-usage-reporter:sync` forces that scan right now.
 - `/claude-usage-reporter:status` shows what is configured and the last report.
+- `/claude-usage-reporter:privacy` lists the optional details this PC reports and turns any of them
+  off (see [What gets sent](#what-gets-sent)); `--no-<field>` does the same at setup time.
 - `/plugin update` picks up new versions. Requires Node 18+ on the PC.
 
 ## Install standalone (git clone, no plugin)
@@ -50,8 +52,9 @@ node hook.js sync        # optional: upload every past session
 ```
 
 `install` writes the config and adds both the hooks and the status line to `~/.claude/settings.json`;
-re-running it is safe. Other commands: `status`, `test`, `sync`, `uninstall` (removes the hooks and
-restores the previous status line). Start a new Claude Code session for the hooks to take effect.
+re-running it is safe. Other commands: `status`, `privacy`, `test`, `sync`, `uninstall` (removes the
+hooks and restores the previous status line). Start a new Claude Code session for the hooks to take
+effect.
 
 Log: `~/.claude/usage-hook/hook.log`. `CLAUDE_CONFIG_DIR` is honoured.
 
@@ -63,15 +66,38 @@ One `POST /api/ingest` per report, `Authorization: Bearer <token>`:
 {
   "v": 1, "event": "Stop", "sentAt": "2026-09-16T12:00:00Z",
   "pc": { "id": "<machineID from ~/.claude.json>", "name": "My PC", "hostname": "DESKTOP-1", "user": "alice", "platform": "win32 10.0.26200", "account": { "email": "...", "org": "..." } },
-  "session": { "id": "<session uuid>", "cwd": "D:\\Projects\\app", "gitBranch": "main", "version": "2.1.271", "entrypoint": "claude-desktop", "title": "Fix the login page", "startedAt": "..." },
+  "session": { "id": "<session uuid>", "startedAt": "...", "cwd": "D:\\Projects\\app", "gitBranch": "main", "version": "2.1.271", "entrypoint": "claude-desktop", "permissionMode": "default", "endReason": "clear" },
   "messages": [ { "id": "msg_01…", "ts": "…", "model": "claude-fable-5-1", "agentId": null, "agentType": "main", "agentDesc": null,
-                  "input": 32, "output": 190, "cacheRead": 527706, "cacheCreate": 2893, "cache1h": 2893, "cache5m": 0, "thinking": 0, "effort": "high", "requestId": "req_…", "stopReason": "end_turn" } ],
+                  "input": 32, "output": 190, "cacheRead": 527706, "cacheCreate": 2893, "cache1h": 2893, "thinking": 0, "effort": "high" } ],
   "rateLimits": { "capturedAt": "…", "model": "claude-fable-5-1", "rateLimits": { "five_hour": { "used_percentage": 23.5, "resets_at": 1789570000 }, "seven_day": { "used_percentage": 41.2, "resets_at": 1789900000 } } }
 }
 ```
 
-No prompt or response text leaves the machine: only usage numbers, model/agent names, the session
-title (custom title or the first 160 characters of the first prompt), the working directory and branch.
+**No text you or Claude wrote ever leaves the machine.** The transcript is read only for the usage
+counters and the few metadata fields above; prompts, responses, file contents and tool arguments are
+never taken from it.
+
+Always sent, because the dashboard cannot work without it: the PC id and label, the Claude account
+(it is what groups several PCs into one plan), the session id and start time, and per API message the
+message id, timestamp, model, token counts, agent id/type and effort.
+
+Everything else is optional and **on by default**, so an existing install keeps reporting exactly what
+it reported before. Withhold any of it at install time with `--no-<field>`, or later:
+
+```
+node hook.js privacy                # show what this PC reports
+node hook.js privacy cwd off        # stop sending working directories
+node hook.js privacy all off        # send the bare minimum
+```
+
+| field | what it is | cost of turning it off |
+| --- | --- | --- |
+| `id-fallback` | hash of hostname+username, used as the PC id only when Claude Code has no `machineID` | a random id is minted once and kept in `config.json` instead |
+| `hostname`, `user`, `platform` | machine name, OS user name, OS and version | the dashboard shows the PC label alone |
+| `version`, `entrypoint`, `permission-mode`, `end-reason` | Claude Code version, how the session started, its permission mode, why it ended | small details in the session view |
+| `cwd` | working directory | the project name is derived from it, so grouping "by project" stops working |
+| `git-branch` | branch name | branch tags disappear from the session list |
+| `agent-desc` | the task description given to each subagent (free text you wrote) | the per-agent table loses its labels |
 
 ## Caveats
 

@@ -7,6 +7,7 @@
 //   node hook.js install --url U --token T [--name "PC label"] [--no-statusline]   standalone: also adds hooks to settings
 //   node hook.js uninstall             remove config-side hooks and restore the previous status line
 //   node hook.js status
+//   node hook.js privacy [FIELD on|off]   show or change which optional details this PC reports
 //   node hook.js sync                  scan every transcript under ~/.claude/projects and upload what is new (backfill)
 //   node hook.js test                  ping the server with the configured token
 //
@@ -38,6 +39,25 @@ const MARKER = 'claude-usage-hook';
 const EVENTS = ['SessionStart', 'Stop', 'SubagentStop', 'SessionEnd'];
 const BATCH = 1500; // messages per POST
 
+// Details that can be withheld per PC. All of them are ON unless config.json says otherwise, so an existing
+// install keeps reporting exactly what it reported before and only a deliberate opt-out narrows it.
+const OPTIONAL = {
+  idFallback: 'hash of hostname+username as the PC id when Claude Code has no machineID',
+  hostname: 'machine name',
+  user: 'OS user name',
+  platform: 'OS and version',
+  version: 'Claude Code version',
+  entrypoint: 'how the session was started (cli, vscode, ...)',
+  permissionMode: 'permission mode of the session',
+  endReason: 'why the session ended',
+  cwd: 'working directory (the project name is derived from it)',
+  gitBranch: 'git branch',
+  agentDesc: 'subagent task descriptions',
+};
+const OPT_KEYS = Object.keys(OPTIONAL);
+const kebab = (k) => k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+const on = (cfg, k) => !(cfg && cfg.report && cfg.report[k] === false);
+
 // ---------- small helpers ----------
 const readJson = (f, dflt) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return dflt; } };
 const writeJson = (f, o) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(o, null, 2)); };
@@ -63,16 +83,24 @@ function syncStatusline() {
 }
 
 // ---------- PC identity ----------
+// The id is the dashboard's primary key, so it has to stay stable forever: Claude Code's own machineID when it
+// has one, else a hash of hostname+username. With idFallback off nothing about the machine may be derivable
+// from the id, so a random one is minted once and kept in config.json instead.
 function pcInfo(cfg) {
   const cj = readJson(path.join(CLAUDE_DIR, '.claude.json'), null) || readJson(path.join(os.homedir(), '.claude.json'), {});
   let id = cj.machineID;
-  if (!id) id = crypto.createHash('sha256').update(`${os.hostname()}|${os.userInfo().username}`).digest('hex');
+  if (!id && on(cfg, 'idFallback')) id = crypto.createHash('sha256').update(`${os.hostname()}|${os.userInfo().username}`).digest('hex');
+  if (!id) {
+    id = (cfg && cfg.pcId) || crypto.randomBytes(16).toString('hex');
+    if (cfg && cfg.pcId !== id) { cfg.pcId = id; writeJson(CONFIG_FILE, cfg); }
+  }
+  const hostname = on(cfg, 'hostname') ? os.hostname() : null;
   return {
     id,
-    name: (cfg && cfg.name) || os.hostname(),
-    hostname: os.hostname(),
-    user: os.userInfo().username,
-    platform: `${os.platform()} ${os.release()}`,
+    name: (cfg && cfg.name) || hostname || `PC-${id.slice(0, 6)}`, // never leak the hostname through the label
+    hostname,
+    user: on(cfg, 'user') ? os.userInfo().username : null,
+    platform: on(cfg, 'platform') ? `${os.platform()} ${os.release()}` : null,
     account: cj.oauthAccount ? { email: cj.oauthAccount.emailAddress, org: cj.oauthAccount.organizationName } : null,
   };
 }
@@ -100,29 +128,18 @@ function readNewLines(file, state) {
   return { lines: text.split('\n').filter(Boolean), offset: offset + consumed };
 }
 
-function stripReminders(s) {
-  return String(s).replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').replace(/<[a-z-]+>[\s\S]*?<\/[a-z-]+>/g, '').trim();
-}
-
-function parseLines(lines, agent, out) {
+function parseLines(lines, agent, out, opt) {
   for (const line of lines) {
     let o;
     try { o = JSON.parse(line); } catch { continue; }
     if (!o || typeof o !== 'object') continue;
+    // Nothing the user typed is read out of the transcript: only these few metadata fields and the usage counters.
     const meta = out.session;
-    if (o.cwd && !meta.cwd) meta.cwd = o.cwd;
-    if (o.gitBranch && !meta.gitBranch) meta.gitBranch = o.gitBranch;
-    if (o.version) meta.version = o.version;
-    if (o.entrypoint && !meta.entrypoint) meta.entrypoint = o.entrypoint;
-    if (o.type === 'custom-title' && o.customTitle) meta.title = o.customTitle;
-    if (o.type === 'user' && !agent.id && !meta.firstPrompt && o.message && typeof o.message.content === 'string') {
-      const t = stripReminders(o.message.content);
-      if (t) meta.firstPrompt = t.slice(0, 160);
-    }
-    if (o.timestamp) {
-      if (!meta.startedAt || o.timestamp < meta.startedAt) meta.startedAt = o.timestamp;
-      if (!meta.lastAt || o.timestamp > meta.lastAt) meta.lastAt = o.timestamp;
-    }
+    if (o.cwd && !meta.cwd && opt.cwd) meta.cwd = o.cwd;
+    if (o.gitBranch && !meta.gitBranch && opt.gitBranch) meta.gitBranch = o.gitBranch;
+    if (o.version && opt.version) meta.version = o.version;
+    if (o.entrypoint && !meta.entrypoint && opt.entrypoint) meta.entrypoint = o.entrypoint;
+    if (o.timestamp && (!meta.startedAt || o.timestamp < meta.startedAt)) meta.startedAt = o.timestamp;
     if (o.type !== 'assistant' || !o.message || !o.message.usage || !o.message.id) continue;
     if (o.message.model === '<synthetic>') continue; // Claude Code's own error/notice entries, no API call behind them
     if (out.messages.has(o.message.id)) continue;
@@ -134,23 +151,20 @@ function parseLines(lines, agent, out) {
       model: o.message.model || 'unknown',
       agentId: agent.id || (o.agentId || null),
       agentType: agent.type || (o.isSidechain ? 'sidechain' : 'main'),
-      agentDesc: agent.desc || null,
+      agentDesc: (opt.agentDesc && agent.desc) || null,
       input: u.input_tokens || 0,
       output: u.output_tokens || 0,
       cacheRead: u.cache_read_input_tokens || 0,
       cacheCreate: u.cache_creation_input_tokens || 0,
-      cache1h: cc.ephemeral_1h_input_tokens || 0,
-      cache5m: cc.ephemeral_5m_input_tokens || 0,
+      cache1h: cc.ephemeral_1h_input_tokens || 0, // 5m writes are the remainder, derived by the server
       thinking: (u.output_tokens_details && u.output_tokens_details.thinking_tokens) || 0,
       effort: o.effort || o.perTurnEffort || null,
-      requestId: o.requestId || null,
-      stopReason: o.message.stop_reason || null,
     });
   }
 }
 
 // Collect new usage for one session: main transcript + <dir>/<sessionId>/subagents/agent-*.jsonl
-function collectSession(transcriptPath, sessionId, state) {
+function collectSession(transcriptPath, sessionId, state, opt) {
   const out = { session: { id: sessionId }, messages: new Map(), files: {} };
   const files = [{ file: transcriptPath, agent: {} }];
   const subDir = path.join(path.dirname(transcriptPath), sessionId, 'subagents');
@@ -162,11 +176,9 @@ function collectSession(transcriptPath, sessionId, state) {
   for (const { file, agent } of files) {
     const prev = (state.files && state.files[file]) || {};
     const { lines, offset } = readNewLines(file, prev);
-    parseLines(lines, agent, out);
+    parseLines(lines, agent, out, opt);
     out.files[file] = { offset };
   }
-  if (!out.session.title && out.session.firstPrompt) out.session.title = out.session.firstPrompt;
-  delete out.session.firstPrompt;
   return out;
 }
 
@@ -207,15 +219,16 @@ function rateLimitsSnapshot(state) {
 async function report(event, cfg) {
   const state = readJson(STATE_FILE, { files: {} });
   state.files = state.files || {};
+  const opt = Object.fromEntries(OPT_KEYS.map((k) => [k, on(cfg, k)]));
   const pc = pcInfo(cfg);
   const transcript = event.transcript_path;
   const sessionId = event.session_id;
   if (!sessionId) { log(`${event.hook_event_name}: no session_id in event, ignored`); return { sent: 0 }; }
   let collected = { session: { id: sessionId }, messages: new Map(), files: {} };
-  if (transcript && sessionId && fs.existsSync(transcript)) collected = collectSession(transcript, sessionId, state);
-  if (event.cwd && !collected.session.cwd) collected.session.cwd = event.cwd;
-  if (event.permission_mode) collected.session.permissionMode = event.permission_mode;
-  if (event.hook_event_name === 'SessionEnd') collected.session.endReason = event.reason || 'ended';
+  if (transcript && sessionId && fs.existsSync(transcript)) collected = collectSession(transcript, sessionId, state, opt);
+  if (event.cwd && !collected.session.cwd && opt.cwd) collected.session.cwd = event.cwd;
+  if (event.permission_mode && opt.permissionMode) collected.session.permissionMode = event.permission_mode;
+  if (event.hook_event_name === 'SessionEnd' && opt.endReason) collected.session.endReason = event.reason || 'ended';
   const rate = rateLimitsSnapshot(state);
   const msgs = [...collected.messages.values()];
   const lifecycle = event.hook_event_name === 'SessionStart' || event.hook_event_name === 'SessionEnd';
@@ -322,13 +335,50 @@ function parseArgs(argv) {
   return a;
 }
 
+// --no-cwd, --no-user, ... on install/setup. Only ever writes the keys that were named, so re-running
+// install without any flag keeps whatever the PC was already configured to withhold.
+function reportFlags(args, prev) {
+  const report = { ...(prev || {}) };
+  for (const k of OPT_KEYS) {
+    if (args[`no-${kebab(k)}`] || args[`no-${k.toLowerCase()}`]) report[k] = false;
+    else if (args[kebab(k)] || args[k.toLowerCase()]) report[k] = true;
+  }
+  return Object.keys(report).length ? report : undefined;
+}
+
+function printReport(cfg) {
+  console.log('always reported:  PC id + label + Claude account; session id + start time;');
+  console.log('                  per message: id, time, model, token counts, agent id/type, effort');
+  console.log('optional details:');
+  for (const k of OPT_KEYS) console.log(`  [${on(cfg, k) ? 'x' : ' '}] ${kebab(k).padEnd(16)} ${OPTIONAL[k]}`);
+  console.log(`change with:  node "${SELF}" privacy <field|all> <on|off>`);
+}
+
+function privacy(argv) {
+  const cfg = readJson(CONFIG_FILE, {});
+  const [field, value] = argv;
+  if (field) {
+    const keys = field === 'all' ? OPT_KEYS : OPT_KEYS.filter((k) => k === field || kebab(k) === field);
+    if (!keys.length) { console.error(`unknown field "${field}". Known: ${OPT_KEYS.map(kebab).join(', ')}, all`); process.exitCode = 2; return; }
+    if (value !== 'on' && value !== 'off') { console.error(`usage: node hook.js privacy <field|all> <on|off>`); process.exitCode = 2; return; }
+    cfg.report = { ...(cfg.report || {}) };
+    for (const k of keys) cfg.report[k] = value === 'on';
+    writeJson(CONFIG_FILE, cfg);
+    console.log(`${keys.map(kebab).join(', ')}: ${value}\n`);
+  }
+  printReport(cfg);
+}
+
 const isOurs = (h) => !!(h && typeof h.command === 'string' && (h.command.includes(SELF) || h.command.includes(STATUSLINE) || h.command.includes(STATUSLINE_SRC.replace(/\\/g, '/')) || h.command.includes(MARKER)));
 
 function install(args) {
   const prev = readJson(CONFIG_FILE, {});
   const cfg = { ...prev, url: args.url || prev.url, token: args.token || prev.token, name: args.name || prev.name };
+  const report = reportFlags(args, prev.report);
+  if (report) cfg.report = report;
   if (!cfg.url || !cfg.token) {
     console.error('usage: node hook.js install --url https://server:3003 --token SECRET [--name "PC label"] [--no-statusline] [--insecure]');
+    console.error(`       withhold optional details with ${OPT_KEYS.map((k) => '--no-' + kebab(k)).join(' ')}`);
     process.exit(2);
   }
   if (args.insecure) cfg.insecure = true;
@@ -349,6 +399,7 @@ function install(args) {
   console.log(`settings: ${SETTINGS_FILE}  (hooks: ${EVENTS.join(', ')}${args['no-statusline'] ? '' : '; statusLine'})`);
   console.log(`server:   ${cfg.url}`);
   console.log(`PC:       ${pc.name} (${pc.id.slice(0, 12)}...)`);
+  printReport(cfg);
   console.log('Restart Claude Code sessions for the hooks to take effect. Run "node hook.js sync" to upload past sessions.');
   return test();
 }
@@ -372,14 +423,18 @@ function applyStatusline(settings, cfg, disable) {
 // Plugin mode: /claude-usage-reporter:setup <url> <token> [PC name]. Hooks come from the plugin's hooks.json,
 // so only the config file and the status line are written; hooks left behind by a standalone `install` are removed.
 async function setup(argv) {
-  const [url, token, ...rest] = argv.filter((a) => a !== '--no-statusline');
+  const [url, token, ...rest] = argv.filter((a) => !a.startsWith('--'));
   const noStatusline = argv.includes('--no-statusline');
+  const flags = parseArgs(argv.filter((a) => a.startsWith('--')));
   if (!url || !token || !/^https?:\/\//.test(url)) {
     console.error('usage: /claude-usage-reporter:setup <http(s)://server:3003> <token> [PC name] [--no-statusline]');
     process.exit(2);
   }
-  const cfg = { ...readJson(CONFIG_FILE, {}), url, token };
+  const prev = readJson(CONFIG_FILE, {});
+  const cfg = { ...prev, url, token };
   if (rest.length) cfg.name = rest.join(' ');
+  const report = reportFlags(flags, prev.report);
+  if (report) cfg.report = report;
   const settings = readJson(SETTINGS_FILE, {});
   let removed = 0;
   for (const ev of Object.keys(settings.hooks || {})) {
@@ -395,6 +450,7 @@ async function setup(argv) {
   console.log(`  server:  ${cfg.url}`);
   console.log(`  PC:      ${pc.name} (${pc.id.slice(0, 12)}...)`);
   console.log(`  config:  ${CONFIG_FILE}`);
+  printReport(cfg);
   console.log(`  status line: ${noStatusline ? 'left unchanged (no plan-window percentages will be reported)' : 'installed in ' + SETTINGS_FILE + (cfg.statusLinePassthrough ? ' (previous status line kept as passthrough)' : '')}`);
   if (removed) console.log(`  removed ${removed} hook entr${removed === 1 ? 'y' : 'ies'} from a previous standalone install (the plugin provides them now)`);
   console.log('Reporting starts with the next Claude Code session; past sessions are uploaded now and at every session start.');
@@ -441,6 +497,7 @@ function status() {
   console.log(`hooks:      ${hooks.join(', ') || 'none'}`);
   console.log(`statusline: ${settings.statusLine && isOurs(settings.statusLine) ? 'installed' : 'not installed'}`);
   console.log(`last sent:  ${state.lastSentAt || 'never'}; tracked files: ${Object.keys(state.files || {}).length}`);
+  printReport(cfg);
   const r = readJson(RATE_FILE, null);
   if (r && r.rateLimits) {
     const fh = r.rateLimits.five_hour || {}, sd = r.rateLimits.seven_day || {};
@@ -452,7 +509,7 @@ function status() {
 }
 
 function help() {
-  const lines = fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 13);
+  const lines = fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 14);
   console.log(lines.map((l) => l.replace(/^\/\/ ?/, '')).join('\n'));
 }
 
@@ -464,6 +521,7 @@ function help() {
     if (cmd === 'setup') return await setup(rest);
     if (cmd === 'uninstall') return uninstall();
     if (cmd === 'status') return status();
+    if (cmd === 'privacy') return privacy(rest);
     if (cmd === 'sync') return await syncMode();
     if (cmd === 'test') return await test();
     if (cmd === 'help' || cmd === '--help' || cmd === '-h') return help();
